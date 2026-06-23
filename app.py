@@ -32,6 +32,7 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 DEFAULT_FAST_MODEL = os.environ.get("DEEPSEEK_FAST_MODEL", "deepseek-v4-flash")
 DEFAULT_ACCURATE_MODEL = os.environ.get("DEEPSEEK_ACCURATE_MODEL", "deepseek-v4-pro")
 ACCESS_CODE = os.environ.get("VOC_ACCESS_CODE", "").strip()
+FINAL_LABEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_FINAL_LABEL_CHUNK_SIZE", "8")))
 ACTIVE_JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -1318,6 +1319,67 @@ def merge_final_labels(project_id: str, batch_id: str, result: dict, usage: dict
     write_json(path, existing)
 
 
+def chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def compact_usage(usages: list[dict]) -> dict:
+    result = {"calls": len(usages)}
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, int):
+                result[key] = result.get(key, 0) + value
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            prefix = "completion_"
+            for key, value in details.items():
+                if isinstance(value, int):
+                    result[prefix + key] = result.get(prefix + key, 0) + value
+    return result
+
+
+def retryable_json_error(error: Exception) -> bool:
+    text = str(error)
+    return isinstance(error, json.JSONDecodeError) or any(
+        marker in text
+        for marker in [
+            "Expecting ',' delimiter",
+            "Unterminated string",
+            "Invalid control character",
+            "Extra data",
+            "missing reviews array",
+        ]
+    )
+
+
+def final_label_model_call(project: dict, rules: dict, reviews: list[dict], atomic_rows: list[dict], api_key: str, model: str):
+    try:
+        result, usage = deepseek_chat(
+            api_key,
+            model,
+            final_label_prompt(project, rules, reviews, atomic_rows),
+            max_tokens=12000,
+            temperature=0.08,
+        )
+        return result, [usage]
+    except Exception as error:
+        if len(reviews) <= 1 or not retryable_json_error(error):
+            raise
+        mid = max(1, len(reviews) // 2)
+        left_ids = {r["review_id"] for r in reviews[:mid]}
+        right_ids = {r["review_id"] for r in reviews[mid:]}
+        left_atomic = [row for row in atomic_rows if row.get("review_id") in left_ids]
+        right_atomic = [row for row in atomic_rows if row.get("review_id") in right_ids]
+        left_result, left_usage = final_label_model_call(project, rules, reviews[:mid], left_atomic, api_key, model)
+        right_result, right_usage = final_label_model_call(project, rules, reviews[mid:], right_atomic, api_key, model)
+        return {
+            "reviews": (left_result.get("reviews") or []) + (right_result.get("reviews") or [])
+        }, left_usage + right_usage
+
+
 def process_atomic_batch(project_id: str, batch_id: str, api_key: str, model: str, mock: bool) -> dict:
     project = get_project(project_id)
     batch, reviews = batch_reviews(project_id, batch_id)
@@ -1377,7 +1439,6 @@ def process_final_batch(project_id: str, batch_id: str, api_key: str, model: str
     set_batch_status(project_id, batch_id, status="final_running", model=model, started_at=now_iso(), error="")
     started = time.time()
     try:
-        review_ids = {r["review_id"] for r in reviews}
         if mock:
             result = {
                 "reviews": [
@@ -1394,9 +1455,23 @@ def process_final_batch(project_id: str, batch_id: str, api_key: str, model: str
             }
             usage = {"mock": True}
         else:
-            atomic_rows = atomic_for_review(project_id, review_ids)
-            result, usage = deepseek_chat(api_key, model, final_label_prompt(project, rules, reviews, atomic_rows), max_tokens=24000, temperature=0.08)
+            all_rows = []
+            all_errors = []
+            usages = []
+            for review_chunk in chunks(reviews, FINAL_LABEL_CHUNK_SIZE):
+                review_ids = {r["review_id"] for r in review_chunk}
+                atomic_rows = atomic_for_review(project_id, review_ids)
+                chunk_result, chunk_usages = final_label_model_call(project, rules, review_chunk, atomic_rows, api_key, model)
+                normalized_chunk, chunk_errors = normalize_final_result(chunk_result, review_ids, rules)
+                all_rows.extend(normalized_chunk.get("reviews", []))
+                all_errors.extend(chunk_errors)
+                usages.extend(chunk_usages)
+            result = {"reviews": all_rows}
+            usage = compact_usage(usages)
+        review_ids = {r["review_id"] for r in reviews}
         normalized, errors = normalize_final_result(result, review_ids, rules)
+        if not mock:
+            errors = all_errors + errors
         merge_final_labels(project_id, batch_id, normalized, usage)
         set_batch_status(
             project_id,
