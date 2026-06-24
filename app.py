@@ -32,6 +32,22 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 DEFAULT_FAST_MODEL = os.environ.get("DEEPSEEK_FAST_MODEL", "deepseek-v4-flash")
 DEFAULT_ACCURATE_MODEL = os.environ.get("DEEPSEEK_ACCURATE_MODEL", "deepseek-v4-pro")
 ACCESS_CODE = os.environ.get("VOC_ACCESS_CODE", "").strip()
+
+SNAPSHOT_FILES = [
+    "reviews.json",
+    "batches.json",
+    "atomic_results.json",
+    "dimension_candidates.json",
+    "dimension_model.json",
+    "locked_dimensions.json",
+    "final_labels.json",
+    "analysis_summary.json",
+    "job_status.json",
+]
+FINAL_LABEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_FINAL_LABEL_CHUNK_SIZE", "8")))
+DIMENSION_PRODUCT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_PRODUCT_TAG_LIMIT", "60")))
+DIMENSION_CONTEXT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_CONTEXT_TAG_LIMIT", "60")))
+DIMENSION_EVIDENCE_LIMIT = max(40, int(os.environ.get("VOC_DIMENSION_EVIDENCE_LIMIT", "120")))
 ACTIVE_JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -473,6 +489,54 @@ def project_stats(project_id: str):
     }
 
 
+def project_snapshot(project_id: str) -> dict:
+    project = get_project(project_id)
+    if not project:
+        raise ValueError("project_not_found")
+    base = project_dir(project_id)
+    files = {}
+    for name in SNAPSHOT_FILES:
+        path = base / name
+        if path.exists():
+            files[name] = read_json(path, None)
+    return {
+        "schema": "voc-project-snapshot-v1",
+        "exported_at": now_iso(),
+        "project": project,
+        "stats": project_stats(project_id),
+        "files": files,
+    }
+
+
+def restore_project_snapshot(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != "voc-project-snapshot-v1":
+        raise ValueError("invalid_snapshot")
+    project = snapshot.get("project") or {}
+    project_id = str(project.get("id") or "").strip()
+    if not project_id:
+        raise ValueError("missing_project_id")
+    files = snapshot.get("files") or {}
+    if not isinstance(files, dict):
+        raise ValueError("invalid_snapshot_files")
+
+    projects = load_projects()
+    restored = {
+        **project,
+        "restored_at": now_iso(),
+        "updated_at": project.get("updated_at") or now_iso(),
+    }
+    projects = [p for p in projects if p.get("id") != project_id]
+    projects.insert(0, restored)
+    save_projects(projects)
+
+    base = project_dir(project_id)
+    base.mkdir(parents=True, exist_ok=True)
+    for name in SNAPSHOT_FILES:
+        if name in files:
+            write_json(base / name, files[name])
+    return {**restored, "stats": project_stats(project_id)}
+
+
 def archive_and_remove(project_id: str, filenames: list[str]) -> None:
     base = project_dir(project_id)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -578,7 +642,14 @@ def extract_json_from_text(text: str):
         raise
 
 
-def deepseek_chat(api_key: str, model: str, messages: list[dict], max_tokens=12000, temperature=0.1, timeout=240):
+class ModelJsonError(ValueError):
+    def __init__(self, message: str, content: str, usage: dict):
+        super().__init__(message)
+        self.content = content
+        self.usage = usage
+
+
+def deepseek_chat_raw(api_key: str, model: str, messages: list[dict], max_tokens=12000, temperature=0.1, timeout=240):
     payload = {
         "model": model,
         "messages": messages,
@@ -606,7 +677,16 @@ def deepseek_chat(api_key: str, model: str, messages: list[dict], max_tokens=120
 
     content = data["choices"][0]["message"]["content"]
     usage = data.get("usage", {})
-    return extract_json_from_text(content), usage
+    return content, usage
+
+
+def deepseek_chat(api_key: str, model: str, messages: list[dict], max_tokens=12000, temperature=0.1, timeout=240):
+    content, usage = deepseek_chat_raw(api_key, model, messages, max_tokens=max_tokens, temperature=temperature, timeout=timeout)
+    try:
+        parsed = extract_json_from_text(content)
+    except json.JSONDecodeError as e:
+        raise ModelJsonError(str(e), content, usage) from e
+    return parsed, usage
 
 
 def atomic_prompt(project: dict, reviews: list[dict]) -> list[dict]:
@@ -622,10 +702,12 @@ def atomic_prompt(project: dict, reviews: list[dict]) -> list[dict]:
         "requirements": [
             "逐条完整阅读 review_original。",
             "同时输出 review_translation_zh：忠实、完整、自然的中文全文翻译；不要使用已有劣质翻译。",
-            "一条 review 可以拆多个 atomic_tags。",
-            "atomic_tag_zh 必须是中文短句；品牌、型号、缩写、专有名词可保留英文。",
+            "一条 review 可以拆多个 atomic_tags；不要只抽最明显的 1-2 个，要全面覆盖产品表现、使用背景、购买路径和明确态度。",
+            "atomic_tag_zh 必须是中文短句，表达一个最小语义事实；品牌、型号、缩写、专有名词可保留英文。",
             "evidence_original 必须是原文短证据，不要整段复制。",
-            "usage_marks 可以多选，只能来自枚举。",
+            "evidence_zh 必须忠实翻译 evidence_original，短而清楚，不能加入原文没有的信息。",
+            "usage_marks 可以多选，只能来自枚举；同一语义既支持产品表现又支持 Context 时，必须同时写入两类，不要强行二选一。",
+            "用户背景类包括人群、关系、场景、目的、搭配设备、购买行为/态度；产品类包括功能、性能、结构、体验结果。",
             "sentiment 只能是 P、N、M、事实提及。Drop 内容放 drop_records。",
             "不要生成购买决策维度；不要做聚类。",
             "不确定时 need_review=true，并写 review_flags。",
@@ -639,6 +721,7 @@ def atomic_prompt(project: dict, reviews: list[dict]) -> list[dict]:
                         {
                             "atomic_tag_zh": "string",
                             "evidence_original": "string",
+                            "evidence_zh": "string",
                             "sentiment": "P|N|M|事实提及",
                             "usage_marks": ["产品表现"],
                             "confidence": 0.0,
@@ -700,6 +783,54 @@ def validate_atomic_result(result: dict, expected_ids: set[str]):
     return errors
 
 
+def result_review_ids(result: dict) -> set[str]:
+    rows = result.get("reviews") if isinstance(result, dict) else []
+    if not isinstance(rows, list):
+        return set()
+    return {str(item.get("review_id", "")).strip() for item in rows if str(item.get("review_id", "")).strip()}
+
+
+def merge_atomic_model_results(parts: list[dict]) -> dict:
+    merged = {}
+    for part in parts:
+        rows = part.get("reviews") if isinstance(part, dict) else []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            rid = str(row.get("review_id", "")).strip()
+            if rid:
+                merged[rid] = row
+    return {"reviews": list(merged.values())}
+
+
+def atomic_model_call(project: dict, reviews: list[dict], api_key: str, model: str):
+    result, usage = deepseek_chat(api_key, model, atomic_prompt(project, reviews))
+    expected_ids = {r["review_id"] for r in reviews}
+    errors = validate_atomic_result(result, expected_ids)
+    missing_ids = expected_ids - result_review_ids(result)
+    if not errors:
+        return result, [usage]
+    if len(reviews) <= 1:
+        return result, [usage]
+
+    if missing_ids:
+        present_result = {
+            "reviews": [
+                row
+                for row in (result.get("reviews") or [])
+                if str(row.get("review_id", "")).strip() in expected_ids
+            ]
+        }
+        retry_reviews = [r for r in reviews if r["review_id"] in missing_ids]
+        retry_result, retry_usage = atomic_model_call(project, retry_reviews, api_key, model)
+        return merge_atomic_model_results([present_result, retry_result]), [usage] + retry_usage
+
+    mid = max(1, len(reviews) // 2)
+    left_result, left_usage = atomic_model_call(project, reviews[:mid], api_key, model)
+    right_result, right_usage = atomic_model_call(project, reviews[mid:], api_key, model)
+    return merge_atomic_model_results([left_result, right_result]), [usage] + left_usage + right_usage
+
+
 def mock_atomic_extract(reviews: list[dict]):
     rows = []
     for r in reviews:
@@ -712,6 +843,7 @@ def mock_atomic_extract(reviews: list[dict]):
                 {
                     "atomic_tag_zh": "整体评价正向但需人工确认具体原因",
                     "evidence_original": text[:120],
+                    "evidence_zh": f"模拟翻译：{text[:120]}",
                     "sentiment": "P",
                     "usage_marks": ["泛化评价"],
                     "confidence": 0.35,
@@ -722,6 +854,7 @@ def mock_atomic_extract(reviews: list[dict]):
                 {
                     "atomic_tag_zh": "出现无法正常使用或故障反馈",
                     "evidence_original": text[:120],
+                    "evidence_zh": f"模拟翻译：{text[:120]}",
                     "sentiment": "N",
                     "usage_marks": ["产品表现"],
                     "confidence": 0.35,
@@ -745,9 +878,13 @@ def mock_atomic_extract(reviews: list[dict]):
 def merge_atomic_results(project_id: str, batch_id: str, result: dict, usage: dict):
     path = project_dir(project_id) / "atomic_results.json"
     existing = read_json(path, [])
-    batch_ids = {r.get("batch_id") for r in existing}
-    if batch_id in batch_ids:
-        existing = [r for r in existing if r.get("batch_id") != batch_id]
+    returned_ids = result_review_ids(result)
+    if returned_ids:
+        existing = [
+            r
+            for r in existing
+            if not (r.get("batch_id") == batch_id and str(r.get("review_id", "")).strip() in returned_ids)
+        ]
     for item in result.get("reviews", []):
         item["batch_id"] = batch_id
         item["usage"] = usage
@@ -801,18 +938,23 @@ def propose_dimensions(project_id: str):
 
 
 def dimension_model_prompt(project: dict, candidates: dict, atomic: list[dict]) -> list[dict]:
+    prompt_candidates = {
+        "note": candidates.get("note", ""),
+        "product_atomic_pool": (candidates.get("product_atomic_pool", []) or [])[:DIMENSION_PRODUCT_TAG_LIMIT],
+        "context_atomic_pool": (candidates.get("context_atomic_pool", []) or [])[:DIMENSION_CONTEXT_TAG_LIMIT],
+    }
     compact_atomic = []
     candidate_tags = {
         item.get("atomic_tag", "")
-        for item in (candidates.get("product_atomic_pool", [])[:80] + candidates.get("context_atomic_pool", [])[:80])
+        for item in (prompt_candidates["product_atomic_pool"] + prompt_candidates["context_atomic_pool"])
     }
     seen_tags = set()
     for row in atomic:
         for tag in (row.get("atomic_tags", []) or []):
             tag_text = tag.get("atomic_tag_zh", "")
-            if tag_text not in candidate_tags and len(compact_atomic) >= 80:
+            if tag_text not in candidate_tags and len(compact_atomic) >= DIMENSION_EVIDENCE_LIMIT // 2:
                 continue
-            if tag_text in seen_tags and len(compact_atomic) >= 120:
+            if tag_text in seen_tags and len(compact_atomic) >= DIMENSION_EVIDENCE_LIMIT:
                 continue
             compact_atomic.append(
                 {
@@ -821,12 +963,13 @@ def dimension_model_prompt(project: dict, candidates: dict, atomic: list[dict]) 
                     "sentiment": tag.get("sentiment", ""),
                     "usage_marks": tag.get("usage_marks", []),
                     "evidence_original": tag.get("evidence_original", ""),
+                    "evidence_zh": tag.get("evidence_zh", ""),
                 }
             )
             seen_tags.add(tag_text)
-            if len(compact_atomic) >= 180:
+            if len(compact_atomic) >= DIMENSION_EVIDENCE_LIMIT:
                 break
-        if len(compact_atomic) >= 180:
+        if len(compact_atomic) >= DIMENSION_EVIDENCE_LIMIT:
             break
     task = {
         "task": "build_dimension_draft_from_atomic_tags",
@@ -835,14 +978,15 @@ def dimension_model_prompt(project: dict, candidates: dict, atomic: list[dict]) 
             "category": project.get("category", ""),
             "description": project.get("description", ""),
         },
-        "candidates": candidates,
+        "candidates": prompt_candidates,
         "atomic_evidence_sample": compact_atomic,
         "requirements": [
             "不要按关键词机械聚类，要理解最小语义标签背后的购买决策问题。",
             "优先基于候选池和代表证据建立维度，不要逐条复述样本。",
             "产品购买决策维度必须是买家会用来判断是否购买/留下/退货的一级问题。",
             "Context 字段必须是人群、场景、用途、购买路径、使用阻碍等背景信息，不要混入产品性能。",
-            "维度数量不要过多。产品购买决策维度建议 6-10 个，Context 字段建议 8-14 个。",
+            "维度数量不要过多。产品购买决策维度建议 6-8 个，Context 字段建议 8-12 个。",
+            "每个字段写短句，定义和边界要清楚但不要长篇解释。",
             "每个维度都要写清楚 P/N/M/0 的边界，方便后续逐条打标。",
             "输出中文。不要写 Listing 文案，只写分析维度定义。",
         ],
@@ -877,6 +1021,40 @@ def dimension_model_prompt(project: dict, candidates: dict, atomic: list[dict]) 
     }
     return [
         {"role": "system", "content": SKILL_RULE + "\n你现在只生成可讨论的维度草案，必须输出 json object。"},
+        {"role": "user", "content": json.dumps(task, ensure_ascii=False)},
+    ]
+
+
+def repair_dimension_model_prompt(project: dict, candidates: dict, broken_content: str, error: str) -> list[dict]:
+    prompt_candidates = {
+        "product_atomic_pool": (candidates.get("product_atomic_pool", []) or [])[:DIMENSION_PRODUCT_TAG_LIMIT],
+        "context_atomic_pool": (candidates.get("context_atomic_pool", []) or [])[:DIMENSION_CONTEXT_TAG_LIMIT],
+    }
+    task = {
+        "task": "repair_or_rebuild_dimension_draft_json",
+        "product": {
+            "name": project.get("name", ""),
+            "category": project.get("category", ""),
+            "description": project.get("description", ""),
+        },
+        "parse_error": error,
+        "broken_output": broken_content[:12000],
+        "candidate_atomic_tags": prompt_candidates,
+        "requirements": [
+            "只输出严格 JSON object，不要 Markdown。",
+            "如果 broken_output 可修复，保留其主要维度；如果明显截断，基于候选标签补全缺失字段。",
+            "产品购买决策维度 6-8 个，Context 字段 8-12 个。",
+            "字段内容必须简短清楚，中文输出，不写 Listing 文案。",
+        ],
+        "output_schema_keys": [
+            "decision_dimensions",
+            "context_fields",
+            "overflow_or_other",
+            "need_human_decisions",
+        ],
+    }
+    return [
+        {"role": "system", "content": SKILL_RULE + "\n你现在修复维度草案 JSON。必须输出可被 json.loads 解析的 json object。"},
         {"role": "user", "content": json.dumps(task, ensure_ascii=False)},
     ]
 
@@ -916,6 +1094,145 @@ def mock_dimension_model(candidates: dict):
     }
 
 
+def normalize_str(value, default=""):
+    text = str(value or "").strip()
+    return text or default
+
+
+def normalize_dimension_list(items: list, defaults: dict, prefix: str, limit: int):
+    rows = []
+    for index, item in enumerate((items or [])[:limit], start=1):
+        if not isinstance(item, dict):
+            continue
+        row = {}
+        for key, default in defaults.items():
+            if key == "source_atomic_tags":
+                source = item.get(key, [])
+                if isinstance(source, str):
+                    source = [source]
+                row[key] = [normalize_str(x) for x in source if normalize_str(x)][:12]
+            else:
+                row[key] = normalize_str(item.get(key), default.format(i=index, name=normalize_str(item.get("name_zh"), prefix)))
+        if not row.get("name_zh"):
+            row["name_zh"] = f"{prefix}{index}"
+        rows.append(row)
+    return rows
+
+
+def fallback_dimension_model(candidates: dict, warning: str):
+    product = (candidates.get("product_atomic_pool", []) or [])[:8]
+    context = (candidates.get("context_atomic_pool", []) or [])[:12]
+    decision = []
+    for index, item in enumerate(product, start=1):
+        tag = normalize_str(item.get("atomic_tag"), f"候选产品表现{index}")
+        decision.append(
+            {
+                "name_zh": f"待确认产品维度{index}",
+                "definition_zh": f"由候选语义“{tag}”触发，需人工归并为更清晰的购买决策维度。",
+                "decision_question_zh": "该产品表现是否影响买家购买、留用或退货判断？",
+                "p_rule_zh": "原文明确表达该表现满足需求或优于预期。",
+                "n_rule_zh": "原文明确表达该表现失败、限制使用或低于预期。",
+                "m_rule_zh": "只客观提到该表现，没有明确好坏。",
+                "zero_rule_zh": "未提及或不能语义支持该维度。",
+                "boundary_zh": "这是系统保底草案，需人工改名、合并、删除并补充边界后再锁定。",
+                "source_atomic_tags": [tag],
+                "listing_use_zh": "确认后可用于卖点排序、风险说明或图片信息层级。",
+            }
+        )
+    context_fields = []
+    for index, item in enumerate(context, start=1):
+        tag = normalize_str(item.get("atomic_tag"), f"候选背景信息{index}")
+        context_fields.append(
+            {
+                "name_zh": f"待确认Context{index}",
+                "definition_zh": f"由候选语义“{tag}”触发，需人工判断是否属于人群、场景、用途或购买路径。",
+                "evidence_required_zh": "必须有原文明确背景证据，不能从产品类型或评价倾向推断。",
+                "boundary_zh": "这是系统保底草案，需人工改名、合并、删除并补充边界后再锁定。",
+                "source_atomic_tags": [tag],
+                "analysis_use_zh": "确认后可用于理解用户画像、使用场景或购买路径。",
+            }
+        )
+    return {
+        "decision_dimensions": decision,
+        "context_fields": context_fields,
+        "overflow_or_other": [],
+        "need_human_decisions": [
+            "模型维度草案 JSON 输出不完整，系统已用候选语义池生成保底草案。",
+            "请重点检查维度名称、合并关系和 P/N/M/0 边界后再锁定规则。",
+            warning[:300],
+        ],
+    }
+
+
+def normalize_dimension_model(draft: dict, candidates: dict, warning: str = ""):
+    if not isinstance(draft, dict):
+        draft = {}
+    decision_defaults = {
+        "name_zh": "待确认产品维度{i}",
+        "definition_zh": "需人工补充该产品购买决策维度的定义。",
+        "decision_question_zh": "该维度是否影响买家购买、留用或退货判断？",
+        "p_rule_zh": "原文明确表达该维度表现正向。",
+        "n_rule_zh": "原文明确表达该维度表现负向。",
+        "m_rule_zh": "只客观提到该维度，没有明确好坏。",
+        "zero_rule_zh": "未提及或不能语义支持该维度。",
+        "boundary_zh": "需人工确认边界。",
+        "source_atomic_tags": [],
+        "listing_use_zh": "确认后可用于 Listing 图文信息层级或运营问题定位。",
+    }
+    context_defaults = {
+        "name_zh": "待确认Context{i}",
+        "definition_zh": "需人工补充该 Context 字段定义。",
+        "evidence_required_zh": "必须有原文明确证据。",
+        "boundary_zh": "需人工确认边界。",
+        "source_atomic_tags": [],
+        "analysis_use_zh": "确认后可用于用户画像、使用场景或购买路径分析。",
+    }
+    normalized = {
+        "decision_dimensions": normalize_dimension_list(draft.get("decision_dimensions", []), decision_defaults, "待确认产品维度", 12),
+        "context_fields": normalize_dimension_list(draft.get("context_fields", []), context_defaults, "待确认Context", 16),
+        "overflow_or_other": draft.get("overflow_or_other", []) if isinstance(draft.get("overflow_or_other", []), list) else [],
+        "need_human_decisions": draft.get("need_human_decisions", []) if isinstance(draft.get("need_human_decisions", []), list) else [],
+    }
+    if not normalized["decision_dimensions"] and not normalized["context_fields"]:
+        normalized = fallback_dimension_model(candidates, warning or "模型未返回可用维度。")
+    elif warning:
+        normalized["need_human_decisions"].append(warning[:300])
+    return normalized
+
+
+def generate_dimension_model_with_repair(project: dict, candidates: dict, atomic: list[dict], api_key: str, model: str):
+    try:
+        return deepseek_chat(
+            api_key,
+            model,
+            dimension_model_prompt(project, candidates, atomic),
+            max_tokens=16000,
+            temperature=0.08,
+            timeout=360,
+        )
+    except ModelJsonError as first_error:
+        repair_usages = [first_error.usage]
+        warning = f"第一次维度草案 JSON 解析失败：{first_error}"
+        try:
+            repaired, repair_usage = deepseek_chat(
+                api_key,
+                model,
+                repair_dimension_model_prompt(project, candidates, first_error.content, str(first_error)),
+                max_tokens=14000,
+                temperature=0,
+                timeout=360,
+            )
+            repair_usages.append(repair_usage)
+            return repaired, compact_usage(repair_usages)
+        except ModelJsonError as repair_error:
+            repair_usages.append(repair_error.usage)
+            draft = fallback_dimension_model(candidates, f"{warning}；二次修复仍失败：{repair_error}")
+            return draft, compact_usage(repair_usages + [{"fallback": 1}])
+        except Exception as repair_error:
+            draft = fallback_dimension_model(candidates, f"{warning}；二次修复调用失败：{repair_error}")
+            return draft, compact_usage(repair_usages + [{"fallback": 1}])
+
+
 def generate_dimension_model(project_id: str, api_key: str, model: str, mock: bool):
     project = get_project(project_id)
     atomic = read_json(project_dir(project_id) / "atomic_results.json", [])
@@ -923,7 +1240,8 @@ def generate_dimension_model(project_id: str, api_key: str, model: str, mock: bo
     if mock:
         draft, usage = mock_dimension_model(candidates), {"mock": True}
     else:
-        draft, usage = deepseek_chat(api_key, model, dimension_model_prompt(project, candidates, atomic), max_tokens=10000, temperature=0.12, timeout=360)
+        draft, usage = generate_dimension_model_with_repair(project, candidates, atomic, api_key, model)
+    draft = normalize_dimension_model(draft, candidates)
     draft["model"] = model
     draft["usage"] = usage
     draft["generated_at"] = now_iso()
@@ -1318,6 +1636,67 @@ def merge_final_labels(project_id: str, batch_id: str, result: dict, usage: dict
     write_json(path, existing)
 
 
+def chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def compact_usage(usages: list[dict]) -> dict:
+    result = {"calls": len(usages)}
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, int):
+                result[key] = result.get(key, 0) + value
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            prefix = "completion_"
+            for key, value in details.items():
+                if isinstance(value, int):
+                    result[prefix + key] = result.get(prefix + key, 0) + value
+    return result
+
+
+def retryable_json_error(error: Exception) -> bool:
+    text = str(error)
+    return isinstance(error, json.JSONDecodeError) or any(
+        marker in text
+        for marker in [
+            "Expecting ',' delimiter",
+            "Unterminated string",
+            "Invalid control character",
+            "Extra data",
+            "missing reviews array",
+        ]
+    )
+
+
+def final_label_model_call(project: dict, rules: dict, reviews: list[dict], atomic_rows: list[dict], api_key: str, model: str):
+    try:
+        result, usage = deepseek_chat(
+            api_key,
+            model,
+            final_label_prompt(project, rules, reviews, atomic_rows),
+            max_tokens=12000,
+            temperature=0.08,
+        )
+        return result, [usage]
+    except Exception as error:
+        if len(reviews) <= 1 or not retryable_json_error(error):
+            raise
+        mid = max(1, len(reviews) // 2)
+        left_ids = {r["review_id"] for r in reviews[:mid]}
+        right_ids = {r["review_id"] for r in reviews[mid:]}
+        left_atomic = [row for row in atomic_rows if row.get("review_id") in left_ids]
+        right_atomic = [row for row in atomic_rows if row.get("review_id") in right_ids]
+        left_result, left_usage = final_label_model_call(project, rules, reviews[:mid], left_atomic, api_key, model)
+        right_result, right_usage = final_label_model_call(project, rules, reviews[mid:], right_atomic, api_key, model)
+        return {
+            "reviews": (left_result.get("reviews") or []) + (right_result.get("reviews") or [])
+        }, left_usage + right_usage
+
+
 def process_atomic_batch(project_id: str, batch_id: str, api_key: str, model: str, mock: bool) -> dict:
     project = get_project(project_id)
     batch, reviews = batch_reviews(project_id, batch_id)
@@ -1330,20 +1709,48 @@ def process_atomic_batch(project_id: str, batch_id: str, api_key: str, model: st
     if not mock and not api_key:
         raise ValueError("missing_deepseek_key")
 
+    existing_rows = read_json(project_dir(project_id) / "atomic_results.json", [])
+    full_expected_ids = {r["review_id"] for r in reviews}
+    existing_ids = {
+        str(row.get("review_id", "")).strip()
+        for row in existing_rows
+        if row.get("batch_id") == batch_id and str(row.get("review_id", "")).strip() in full_expected_ids
+    }
+    pending_reviews = [r for r in reviews if r["review_id"] not in existing_ids]
+    if not pending_reviews:
+        set_batch_status(project_id, batch_id, status="done", finished_at=now_iso(), error="")
+        return {
+            "status": "ok",
+            "validation_errors": [],
+            "usage": {"skipped": True, "reason": "batch_already_complete"},
+            "duration_sec": 0,
+            "stats": project_stats(project_id),
+        }
+
     set_batch_status(project_id, batch_id, status="running", model=model, started_at=now_iso(), error="")
     started = time.time()
     try:
         if mock:
-            result, usage = mock_atomic_extract(reviews)
+            result, usage = mock_atomic_extract(pending_reviews)
         else:
-            result, usage = deepseek_chat(api_key, model, atomic_prompt(project, reviews))
-        errors = validate_atomic_result(result, {r["review_id"] for r in reviews})
+            result, usages = atomic_model_call(project, pending_reviews, api_key, model)
+            usage = compact_usage(usages) if len(usages) > 1 else usages[0]
+        errors = validate_atomic_result(result, {r["review_id"] for r in pending_reviews})
         merge_atomic_results(project_id, batch_id, result, usage)
         propose_dimensions(project_id)
+        latest_rows = read_json(project_dir(project_id) / "atomic_results.json", [])
+        completed_ids = {
+            str(row.get("review_id", "")).strip()
+            for row in latest_rows
+            if row.get("batch_id") == batch_id and str(row.get("review_id", "")).strip() in full_expected_ids
+        }
+        missing_after = sorted(full_expected_ids - completed_ids)
+        if missing_after:
+            errors.append(f"still missing review ids: {', '.join(missing_after[:10])}")
         set_batch_status(
             project_id,
             batch_id,
-            status="done" if not errors else "done_with_warnings",
+            status="done" if not missing_after and not errors else "partial",
             finished_at=now_iso(),
             error="；".join(errors[:5]),
         )
@@ -1377,7 +1784,6 @@ def process_final_batch(project_id: str, batch_id: str, api_key: str, model: str
     set_batch_status(project_id, batch_id, status="final_running", model=model, started_at=now_iso(), error="")
     started = time.time()
     try:
-        review_ids = {r["review_id"] for r in reviews}
         if mock:
             result = {
                 "reviews": [
@@ -1394,9 +1800,23 @@ def process_final_batch(project_id: str, batch_id: str, api_key: str, model: str
             }
             usage = {"mock": True}
         else:
-            atomic_rows = atomic_for_review(project_id, review_ids)
-            result, usage = deepseek_chat(api_key, model, final_label_prompt(project, rules, reviews, atomic_rows), max_tokens=24000, temperature=0.08)
+            all_rows = []
+            all_errors = []
+            usages = []
+            for review_chunk in chunks(reviews, FINAL_LABEL_CHUNK_SIZE):
+                review_ids = {r["review_id"] for r in review_chunk}
+                atomic_rows = atomic_for_review(project_id, review_ids)
+                chunk_result, chunk_usages = final_label_model_call(project, rules, review_chunk, atomic_rows, api_key, model)
+                normalized_chunk, chunk_errors = normalize_final_result(chunk_result, review_ids, rules)
+                all_rows.extend(normalized_chunk.get("reviews", []))
+                all_errors.extend(chunk_errors)
+                usages.extend(chunk_usages)
+            result = {"reviews": all_rows}
+            usage = compact_usage(usages)
+        review_ids = {r["review_id"] for r in reviews}
         normalized, errors = normalize_final_result(result, review_ids, rules)
+        if not mock:
+            errors = all_errors + errors
         merge_final_labels(project_id, batch_id, normalized, usage)
         set_batch_status(
             project_id,
@@ -1418,7 +1838,7 @@ def process_final_batch(project_id: str, batch_id: str, api_key: str, model: str
         raise
 
 
-ATOMIC_DONE_STATUSES = {"done", "done_with_warnings", "final_done", "final_done_with_warnings"}
+ATOMIC_DONE_STATUSES = {"done", "final_done", "final_done_with_warnings"}
 FINAL_DONE_STATUSES = {"final_done", "final_done_with_warnings"}
 RUNNING_JOB_STATUSES = {"running", "starting"}
 
@@ -1435,15 +1855,20 @@ def selectable_batches(project_id: str, kind: str, scope: str) -> list[dict]:
 
 
 def start_background_job(project_id: str, kind: str, scope: str, api_key: str, model: str, mock: bool) -> dict:
-    if kind not in {"atomic", "final"}:
+    if kind not in {"atomic", "dimension", "final"}:
         raise ValueError("invalid_job_kind")
     if not get_project(project_id):
         raise ValueError("project_not_found")
     if not mock and not api_key:
         raise ValueError("missing_deepseek_key")
-    batches = selectable_batches(project_id, kind, scope)
-    if not batches:
-        raise ValueError("no_pending_batches")
+    if kind == "dimension":
+        if not read_json(project_dir(project_id) / "atomic_results.json", []):
+            raise ValueError("missing_atomic_results")
+        batches = [{"id": "DIM001", "start_seq": 0, "end_seq": 0, "review_count": 0}]
+    else:
+        batches = selectable_batches(project_id, kind, scope)
+        if not batches:
+            raise ValueError("no_pending_batches")
 
     with JOBS_LOCK:
         active = ACTIVE_JOBS.get(project_id)
@@ -1495,6 +1920,8 @@ def run_background_job(project_id: str, job_id: str, kind: str, batches: list[di
             try:
                 if kind == "atomic":
                     process_atomic_batch(project_id, batch_id, api_key, model, mock)
+                elif kind == "dimension":
+                    generate_dimension_model(project_id, api_key, model, mock)
                 else:
                     process_final_batch(project_id, batch_id, api_key, model, mock)
                 completed += 1
@@ -1591,17 +2018,39 @@ def build_export(project_id: str):
         ws.append([r.get("seq"), r.get("review_id"), r.get("model"), r.get("star"), r.get("review_original"), r.get("review_translation_zh"), r.get("review_link")])
 
     ws = wb.create_sheet("最小语义标签明细")
-    ws.append(["ReviewID", "批次", "最小语义标签", "初始倾向", "用途标记", "原文证据", "置信度", "NeedReview", "复核标记"])
+    ws.append(["ReviewID", "批次", "Review中文全文", "标签数", "最小语义标签", "初始倾向", "用途标记", "原文证据", "证据中文翻译", "置信度", "NeedReview", "复核标记"])
     for row in atomic:
-        for tag in row.get("atomic_tags", []) or []:
+        tags = row.get("atomic_tags", []) or []
+        if not tags:
             ws.append(
                 [
                     row.get("review_id"),
                     row.get("batch_id"),
+                    row.get("review_translation_zh"),
+                    0,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    row.get("need_review"),
+                    "；".join(row.get("review_flags", []) or []),
+                ]
+            )
+            continue
+        for tag in tags:
+            ws.append(
+                [
+                    row.get("review_id"),
+                    row.get("batch_id"),
+                    row.get("review_translation_zh"),
+                    len(tags),
                     tag.get("atomic_tag_zh"),
                     tag.get("sentiment"),
                     "、".join(tag.get("usage_marks", []) or []),
                     tag.get("evidence_original"),
+                    tag.get("evidence_zh"),
                     tag.get("confidence"),
                     row.get("need_review"),
                     "；".join(row.get("review_flags", []) or []),
@@ -1817,6 +2266,15 @@ class Handler(SimpleHTTPRequestHandler):
                 },
             )
             return
+        m = re.match(r"^/api/projects/([^/]+)/snapshot$", path)
+        if m:
+            try:
+                send_json(self, project_snapshot(m.group(1)))
+            except ValueError as e:
+                send_json(self, {"error": str(e)}, 404 if str(e) == "project_not_found" else 400)
+            except Exception as e:
+                send_json(self, {"error": "snapshot_failed", "detail": str(e)}, 500)
+            return
         m = re.match(r"^/api/projects/([^/]+)/reviews$", path)
         if m:
             project_id = m.group(1)
@@ -1868,6 +2326,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not has_access(self):
             send_json(self, {"error": "unauthorized"}, 401)
+            return
+        if path == "/api/projects/import-snapshot":
+            try:
+                data = body_json(self)
+                project = restore_project_snapshot(data.get("snapshot") or data)
+                send_json(self, {"status": "ok", "project": project})
+            except ValueError as e:
+                send_json(self, {"error": str(e)}, 400)
+            except Exception as e:
+                send_json(self, {"error": "restore_snapshot_failed", "detail": str(e)}, 500)
             return
         if path == "/api/projects":
             data = body_json(self)
@@ -1957,8 +2425,8 @@ class Handler(SimpleHTTPRequestHandler):
                 send_json(self, {"error": "missing_deepseek_key"}, 400)
                 return
             try:
-                draft = generate_dimension_model(project_id, api_key, model, mock)
-                send_json(self, {"status": "ok", "dimension_model": draft, "stats": project_stats(project_id)})
+                job = start_background_job(project_id, "dimension", "all", api_key, model, mock)
+                send_json(self, {"status": "started", "job_status": job, "stats": project_stats(project_id)})
             except Exception as e:
                 send_json(self, {"error": "dimension_model_failed", "detail": str(e)}, 500)
             return
