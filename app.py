@@ -32,6 +32,18 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 DEFAULT_FAST_MODEL = os.environ.get("DEEPSEEK_FAST_MODEL", "deepseek-v4-flash")
 DEFAULT_ACCURATE_MODEL = os.environ.get("DEEPSEEK_ACCURATE_MODEL", "deepseek-v4-pro")
 ACCESS_CODE = os.environ.get("VOC_ACCESS_CODE", "").strip()
+
+SNAPSHOT_FILES = [
+    "reviews.json",
+    "batches.json",
+    "atomic_results.json",
+    "dimension_candidates.json",
+    "dimension_model.json",
+    "locked_dimensions.json",
+    "final_labels.json",
+    "analysis_summary.json",
+    "job_status.json",
+]
 FINAL_LABEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_FINAL_LABEL_CHUNK_SIZE", "8")))
 DIMENSION_PRODUCT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_PRODUCT_TAG_LIMIT", "60")))
 DIMENSION_CONTEXT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_CONTEXT_TAG_LIMIT", "60")))
@@ -477,6 +489,54 @@ def project_stats(project_id: str):
     }
 
 
+def project_snapshot(project_id: str) -> dict:
+    project = get_project(project_id)
+    if not project:
+        raise ValueError("project_not_found")
+    base = project_dir(project_id)
+    files = {}
+    for name in SNAPSHOT_FILES:
+        path = base / name
+        if path.exists():
+            files[name] = read_json(path, None)
+    return {
+        "schema": "voc-project-snapshot-v1",
+        "exported_at": now_iso(),
+        "project": project,
+        "stats": project_stats(project_id),
+        "files": files,
+    }
+
+
+def restore_project_snapshot(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != "voc-project-snapshot-v1":
+        raise ValueError("invalid_snapshot")
+    project = snapshot.get("project") or {}
+    project_id = str(project.get("id") or "").strip()
+    if not project_id:
+        raise ValueError("missing_project_id")
+    files = snapshot.get("files") or {}
+    if not isinstance(files, dict):
+        raise ValueError("invalid_snapshot_files")
+
+    projects = load_projects()
+    restored = {
+        **project,
+        "restored_at": now_iso(),
+        "updated_at": project.get("updated_at") or now_iso(),
+    }
+    projects = [p for p in projects if p.get("id") != project_id]
+    projects.insert(0, restored)
+    save_projects(projects)
+
+    base = project_dir(project_id)
+    base.mkdir(parents=True, exist_ok=True)
+    for name in SNAPSHOT_FILES:
+        if name in files:
+            write_json(base / name, files[name])
+    return {**restored, "stats": project_stats(project_id)}
+
+
 def archive_and_remove(project_id: str, filenames: list[str]) -> None:
     base = project_dir(project_id)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -642,10 +702,12 @@ def atomic_prompt(project: dict, reviews: list[dict]) -> list[dict]:
         "requirements": [
             "逐条完整阅读 review_original。",
             "同时输出 review_translation_zh：忠实、完整、自然的中文全文翻译；不要使用已有劣质翻译。",
-            "一条 review 可以拆多个 atomic_tags。",
-            "atomic_tag_zh 必须是中文短句；品牌、型号、缩写、专有名词可保留英文。",
+            "一条 review 可以拆多个 atomic_tags；不要只抽最明显的 1-2 个，要全面覆盖产品表现、使用背景、购买路径和明确态度。",
+            "atomic_tag_zh 必须是中文短句，表达一个最小语义事实；品牌、型号、缩写、专有名词可保留英文。",
             "evidence_original 必须是原文短证据，不要整段复制。",
-            "usage_marks 可以多选，只能来自枚举。",
+            "evidence_zh 必须忠实翻译 evidence_original，短而清楚，不能加入原文没有的信息。",
+            "usage_marks 可以多选，只能来自枚举；同一语义既支持产品表现又支持 Context 时，必须同时写入两类，不要强行二选一。",
+            "用户背景类包括人群、关系、场景、目的、搭配设备、购买行为/态度；产品类包括功能、性能、结构、体验结果。",
             "sentiment 只能是 P、N、M、事实提及。Drop 内容放 drop_records。",
             "不要生成购买决策维度；不要做聚类。",
             "不确定时 need_review=true，并写 review_flags。",
@@ -659,6 +721,7 @@ def atomic_prompt(project: dict, reviews: list[dict]) -> list[dict]:
                         {
                             "atomic_tag_zh": "string",
                             "evidence_original": "string",
+                            "evidence_zh": "string",
                             "sentiment": "P|N|M|事实提及",
                             "usage_marks": ["产品表现"],
                             "confidence": 0.0,
@@ -780,6 +843,7 @@ def mock_atomic_extract(reviews: list[dict]):
                 {
                     "atomic_tag_zh": "整体评价正向但需人工确认具体原因",
                     "evidence_original": text[:120],
+                    "evidence_zh": f"模拟翻译：{text[:120]}",
                     "sentiment": "P",
                     "usage_marks": ["泛化评价"],
                     "confidence": 0.35,
@@ -790,6 +854,7 @@ def mock_atomic_extract(reviews: list[dict]):
                 {
                     "atomic_tag_zh": "出现无法正常使用或故障反馈",
                     "evidence_original": text[:120],
+                    "evidence_zh": f"模拟翻译：{text[:120]}",
                     "sentiment": "N",
                     "usage_marks": ["产品表现"],
                     "confidence": 0.35,
@@ -898,6 +963,7 @@ def dimension_model_prompt(project: dict, candidates: dict, atomic: list[dict]) 
                     "sentiment": tag.get("sentiment", ""),
                     "usage_marks": tag.get("usage_marks", []),
                     "evidence_original": tag.get("evidence_original", ""),
+                    "evidence_zh": tag.get("evidence_zh", ""),
                 }
             )
             seen_tags.add(tag_text)
@@ -1952,17 +2018,39 @@ def build_export(project_id: str):
         ws.append([r.get("seq"), r.get("review_id"), r.get("model"), r.get("star"), r.get("review_original"), r.get("review_translation_zh"), r.get("review_link")])
 
     ws = wb.create_sheet("最小语义标签明细")
-    ws.append(["ReviewID", "批次", "最小语义标签", "初始倾向", "用途标记", "原文证据", "置信度", "NeedReview", "复核标记"])
+    ws.append(["ReviewID", "批次", "Review中文全文", "标签数", "最小语义标签", "初始倾向", "用途标记", "原文证据", "证据中文翻译", "置信度", "NeedReview", "复核标记"])
     for row in atomic:
-        for tag in row.get("atomic_tags", []) or []:
+        tags = row.get("atomic_tags", []) or []
+        if not tags:
             ws.append(
                 [
                     row.get("review_id"),
                     row.get("batch_id"),
+                    row.get("review_translation_zh"),
+                    0,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    row.get("need_review"),
+                    "；".join(row.get("review_flags", []) or []),
+                ]
+            )
+            continue
+        for tag in tags:
+            ws.append(
+                [
+                    row.get("review_id"),
+                    row.get("batch_id"),
+                    row.get("review_translation_zh"),
+                    len(tags),
                     tag.get("atomic_tag_zh"),
                     tag.get("sentiment"),
                     "、".join(tag.get("usage_marks", []) or []),
                     tag.get("evidence_original"),
+                    tag.get("evidence_zh"),
                     tag.get("confidence"),
                     row.get("need_review"),
                     "；".join(row.get("review_flags", []) or []),
@@ -2178,6 +2266,15 @@ class Handler(SimpleHTTPRequestHandler):
                 },
             )
             return
+        m = re.match(r"^/api/projects/([^/]+)/snapshot$", path)
+        if m:
+            try:
+                send_json(self, project_snapshot(m.group(1)))
+            except ValueError as e:
+                send_json(self, {"error": str(e)}, 404 if str(e) == "project_not_found" else 400)
+            except Exception as e:
+                send_json(self, {"error": "snapshot_failed", "detail": str(e)}, 500)
+            return
         m = re.match(r"^/api/projects/([^/]+)/reviews$", path)
         if m:
             project_id = m.group(1)
@@ -2229,6 +2326,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not has_access(self):
             send_json(self, {"error": "unauthorized"}, 401)
+            return
+        if path == "/api/projects/import-snapshot":
+            try:
+                data = body_json(self)
+                project = restore_project_snapshot(data.get("snapshot") or data)
+                send_json(self, {"status": "ok", "project": project})
+            except ValueError as e:
+                send_json(self, {"error": str(e)}, 400)
+            except Exception as e:
+                send_json(self, {"error": "restore_snapshot_failed", "detail": str(e)}, 500)
             return
         if path == "/api/projects":
             data = body_json(self)
