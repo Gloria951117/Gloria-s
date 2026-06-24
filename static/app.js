@@ -10,6 +10,7 @@ let state = {
   fullReviews: null,
   fullAtomic: null,
   jobPollTimer: null,
+  backups: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -35,6 +36,9 @@ const PAGE_LABELS = [
   ["final", "6 最终打标"],
   ["analysis", "7 细分洞察"],
 ];
+
+const BACKUP_DB_NAME = "voc_project_backups_v1";
+const BACKUP_STORE = "projects";
 
 const CONTEXT_PRESETS = {
   "年龄段": {
@@ -134,6 +138,144 @@ async function request(path, options = {}) {
     throw new Error(message);
   }
   return data;
+}
+
+function openBackupDb() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("当前浏览器不支持本机备份"));
+      return;
+    }
+    const req = indexedDB.open(BACKUP_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(BACKUP_STORE)) db.createObjectStore(BACKUP_STORE, { keyPath: "id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("打开本机备份失败"));
+  });
+}
+
+async function backupTx(mode, fn) {
+  const db = await openBackupDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(BACKUP_STORE, mode);
+      const store = tx.objectStore(BACKUP_STORE);
+      const req = fn(store);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error("本机备份操作失败"));
+      tx.onerror = () => reject(tx.error || new Error("本机备份事务失败"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function saveProjectBackup(snapshot) {
+  const project = snapshot?.project || {};
+  if (!project.id) return;
+  const stats = snapshot.stats || project.stats || {};
+  const record = {
+    id: project.id,
+    name: project.name || "未命名项目",
+    category: project.category || "",
+    stage: project.stage || "",
+    updated_at: project.updated_at || "",
+    stats,
+    saved_at: new Date().toLocaleString("zh-CN"),
+    snapshot,
+  };
+  await backupTx("readwrite", (store) => store.put(record));
+  await loadBackups();
+}
+
+async function listProjectBackups() {
+  try {
+    const rows = await backupTx("readonly", (store) => store.getAll());
+    return (rows || []).sort((a, b) => String(b.saved_at || "").localeCompare(String(a.saved_at || "")));
+  } catch (err) {
+    console.warn(err);
+    return [];
+  }
+}
+
+async function getProjectBackup(id) {
+  return backupTx("readonly", (store) => store.get(id));
+}
+
+async function deleteProjectBackup(id) {
+  await backupTx("readwrite", (store) => store.delete(id));
+  await loadBackups();
+}
+
+async function loadBackups() {
+  state.backups = await listProjectBackups();
+  renderBackupList();
+}
+
+function backupStatusText(item) {
+  const stats = item.stats || {};
+  return `${item.category || "未填写品类"} · ${formatNum(stats.reviews)} 条评论 · 已打标 ${formatNum(stats.final_labeled)} · ${item.stage || "未知阶段"}`;
+}
+
+function renderBackupList() {
+  const box = $("backupList");
+  if (!box) return;
+  if (!state.backups.length) {
+    box.innerHTML = `<div class="hint">暂无本机备份。选择项目后会自动生成。</div>`;
+    return;
+  }
+  const onlineIds = new Set((state.projects || []).map((p) => p.id));
+  box.innerHTML = state.backups
+    .map((item) => {
+      const online = onlineIds.has(item.id);
+      return `
+        <div class="project-item backup-item">
+          <div class="backup-info">
+            <strong>${escapeHtml(item.name)}</strong>
+            <span>${escapeHtml(backupStatusText(item))}</span>
+            <small>本机备份：${escapeHtml(item.saved_at || "")}${online ? " · 当前在线项目已存在" : ""}</small>
+          </div>
+          <div class="backup-actions">
+            <button class="backup-restore" data-id="${escapeHtml(item.id)}">${online ? "覆盖恢复" : "恢复"}</button>
+            <button class="backup-delete" data-id="${escapeHtml(item.id)}">移除备份</button>
+          </div>
+        </div>`;
+    })
+    .join("");
+  box.querySelectorAll(".backup-restore").forEach((btn) => {
+    btn.addEventListener("click", () => restoreProjectBackup(btn.dataset.id).catch(showLog));
+  });
+  box.querySelectorAll(".backup-delete").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (window.confirm("确认移除这个本机备份吗？这不会删除线上项目。")) deleteProjectBackup(btn.dataset.id).catch(showLog);
+    });
+  });
+}
+
+async function backupProjectFromServer(id) {
+  if (!id) return;
+  try {
+    const snapshot = await request(`/api/projects/${id}/snapshot`);
+    await saveProjectBackup(snapshot);
+  } catch (err) {
+    console.warn("项目自动备份失败", err);
+  }
+}
+
+async function restoreProjectBackup(id) {
+  const backup = await getProjectBackup(id);
+  if (!backup?.snapshot) throw new Error("没有找到这个本机备份");
+  const ok = window.confirm(`确认把「${backup.name || id}」从本机备份恢复到线上服务吗？\n\n恢复后可继续从上次结果往后做，不需要重新跑已完成步骤。`);
+  if (!ok) return;
+  await withBusy("正在从本机备份恢复项目...", async () => {
+    const data = await request("/api/projects/import-snapshot", { method: "POST", json: { snapshot: backup.snapshot } });
+    state.currentProjectId = data.project.id;
+    state.activePage = "project";
+    await loadProjects();
+    showLog("项目已从本机备份恢复。你可以继续后续步骤，不需要重跑已完成的 API 任务。");
+  });
 }
 
 function showLog(value) {
@@ -299,6 +441,7 @@ async function loadProjects() {
   const data = await request("/api/projects");
   state.projects = data.projects || [];
   renderProjectList();
+  await loadBackups();
   renderPageTabs();
   if (!state.currentProjectId && state.projects[0]) {
     state.currentProjectId = state.projects[0].id;
@@ -316,12 +459,13 @@ async function loadProject(id) {
   state.currentProject = data;
   renderProjectList();
   renderProject(data);
+  backupProjectFromServer(id);
 }
 
 function renderProjectList() {
   const box = $("projectList");
   if (!state.projects.length) {
-    box.innerHTML = `<div class="hint">暂无项目。</div>`;
+    box.innerHTML = `<div class="hint">暂无线上项目。若下方有本机备份，可点“恢复”找回历史结果。</div>`;
     return;
   }
   box.innerHTML = state.projects
@@ -348,6 +492,7 @@ function renderProjectList() {
     });
   });
   if (state.busy) setBusy(state.busyText);
+  renderBackupList();
 }
 
 function renderEmpty() {
@@ -972,7 +1117,7 @@ async function createProject() {
 
 async function deleteProject(projectId, name) {
   if (!projectId) return;
-  const ok = window.confirm(`确认删除项目「${name || projectId}」吗？\n\n删除后会从列表移除，服务端会先归档项目数据，避免误删后完全找不回。`);
+  const ok = window.confirm(`确认删除项目「${name || projectId}」吗？\n\n删除只会移除线上项目；本机备份会保留，可在左侧“本机自动备份”里恢复。`);
   if (!ok) return;
   await withBusy("正在删除项目...", async () => {
     await request(`/api/projects/${projectId}`, { method: "DELETE" });
