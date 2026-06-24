@@ -34,6 +34,12 @@
           <div class="mini-title">项目列表</div>
           <div class="project-list" id="projectList"></div>
         </div>
+
+        <div class="sidebar-section">
+          <div class="mini-title">本机自动备份</div>
+          <div class="hint">项目每次刷新后会自动备份到当前浏览器。Render 丢历史时，可从这里恢复，避免重新消耗 API。</div>
+          <div class="project-list backup-list" id="backupList"></div>
+        </div>
       </aside>
 
       <main class="workspace">
@@ -44,6 +50,9 @@
           </div>
           <div class="top-actions">
             <button id="refreshBtn">刷新状态</button>
+            <button id="downloadBackupBtn" class="ghost" disabled>下载项目备份</button>
+            <button id="restoreBackupFileBtn" class="ghost">上传备份恢复</button>
+            <input id="restoreBackupInput" type="file" accept=".json,application/json" hidden />
             <a id="exportLink" class="button primary disabled" href="#">下载最终 Excel</a>
           </div>
         </section>
@@ -188,7 +197,7 @@
           <div id="atomicStatus" class="local-run-status idle">当前未处理</div>
           <div class="subtabs" data-subtabs="atomic">
             <button class="subtab active" data-subtab-target="atomicPreviewPane">最近结果预览</button>
-            <button class="subtab" data-subtab-target="atomicRowsPane">全量按行查看</button>
+            <button class="subtab" data-subtab-target="atomicRowsPane">完整语义标签表</button>
           </div>
           <div id="atomicPreviewPane" class="subtab-pane active">
             <div class="mini-title">最近最小语义标签（预览，不是全量）</div>
@@ -197,7 +206,7 @@
           <div id="atomicRowsPane" class="subtab-pane">
             <div class="action-row">
               <button id="loadAtomicRowsBtn" class="ghost">加载/刷新全量最小语义表</button>
-              <span class="hint">一行一个最小语义标签，可追溯 Review、证据、归属和翻译。</span>
+              <span class="hint">按 Review 展开：每条 Review 有几个标签、分别是什么、证据怎么翻译、归属产品还是背景。</span>
             </div>
             <div id="atomicRowsTable" class="table-wrap"></div>
           </div>
@@ -316,6 +325,6 @@
       <button onclick="document.getElementById('logDialog').close()">关闭</button>
     </dialog>
 
-    <script src="/static/app.js?v=20260623-job-tabs"></script>
+    <script src="/static/app.js?v=20260624-traceable-atomic"></script>
   </body>
 </html>
