@@ -13,6 +13,17 @@ FINAL_LABEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_FINAL_LABEL_CHUNK_SIZE",
 DIMENSION_PRODUCT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_PRODUCT_TAG_LIMIT", "60")))
 DIMENSION_CONTEXT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_CONTEXT_TAG_LIMIT", "60")))
 DIMENSION_EVIDENCE_LIMIT = max(40, int(os.environ.get("VOC_DIMENSION_EVIDENCE_LIMIT", "120")))
+SNAPSHOT_FILES = [
+    "reviews.json",
+    "batches.json",
+    "atomic_results.json",
+    "dimension_candidates.json",
+    "dimension_model.json",
+    "locked_dimensions.json",
+    "final_labels.json",
+    "analysis_summary.json",
+    "job_status.json",
+]
 
 
 def chunks(items: list, size: int):
@@ -34,6 +45,54 @@ def compact_usage(usages: list[dict]) -> dict:
                 if isinstance(value, int):
                     result["completion_" + key] = result.get("completion_" + key, 0) + value
     return result
+
+
+def project_snapshot(project_id: str) -> dict:
+    project = app.get_project(project_id)
+    if not project:
+        raise ValueError("project_not_found")
+    base = app.project_dir(project_id)
+    files = {}
+    for name in SNAPSHOT_FILES:
+        path = base / name
+        if path.exists():
+            files[name] = app.read_json(path, None)
+    return {
+        "schema": "voc-project-snapshot-v1",
+        "exported_at": app.now_iso(),
+        "project": project,
+        "stats": app.project_stats(project_id),
+        "files": files,
+    }
+
+
+def restore_project_snapshot(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != "voc-project-snapshot-v1":
+        raise ValueError("invalid_snapshot")
+    project = snapshot.get("project") or {}
+    project_id = str(project.get("id") or "").strip()
+    if not project_id:
+        raise ValueError("missing_project_id")
+    files = snapshot.get("files") or {}
+    if not isinstance(files, dict):
+        raise ValueError("invalid_snapshot_files")
+
+    projects = app.load_projects()
+    restored = {
+        **project,
+        "restored_at": app.now_iso(),
+        "updated_at": project.get("updated_at") or app.now_iso(),
+    }
+    projects = [p for p in projects if p.get("id") != project_id]
+    projects.insert(0, restored)
+    app.save_projects(projects)
+
+    base = app.project_dir(project_id)
+    base.mkdir(parents=True, exist_ok=True)
+    for name in SNAPSHOT_FILES:
+        if name in files:
+            app.write_json(base / name, files[name])
+    return {**restored, "stats": app.project_stats(project_id)}
 
 
 def retryable_json_error(error: Exception) -> bool:
@@ -384,6 +443,51 @@ def process_final_batch(project_id: str, batch_id: str, api_key: str, model: str
 
 app.process_final_batch = process_final_batch
 app.generate_dimension_model = generate_dimension_model
+
+
+ORIGINAL_DO_GET = app.Handler.do_GET
+ORIGINAL_DO_POST = app.Handler.do_POST
+
+
+def patched_do_get(self):
+    parsed = app.urlparse(self.path)
+    path = parsed.path
+    match = app.re.match(r"^/api/projects/([^/]+)/snapshot$", path)
+    if match:
+        if not app.has_access(self):
+            app.send_json(self, {"error": "unauthorized"}, 401)
+            return
+        try:
+            app.send_json(self, project_snapshot(match.group(1)))
+        except ValueError as e:
+            app.send_json(self, {"error": str(e)}, 404 if str(e) == "project_not_found" else 400)
+        except Exception as e:
+            app.send_json(self, {"error": "snapshot_failed", "detail": str(e)}, 500)
+        return
+    return ORIGINAL_DO_GET(self)
+
+
+def patched_do_post(self):
+    parsed = app.urlparse(self.path)
+    path = parsed.path
+    if path == "/api/projects/import-snapshot":
+        if not app.has_access(self):
+            app.send_json(self, {"error": "unauthorized"}, 401)
+            return
+        try:
+            data = app.body_json(self)
+            project = restore_project_snapshot(data.get("snapshot") or data)
+            app.send_json(self, {"status": "ok", "project": project})
+        except ValueError as e:
+            app.send_json(self, {"error": str(e)}, 400)
+        except Exception as e:
+            app.send_json(self, {"error": "restore_snapshot_failed", "detail": str(e)}, 500)
+        return
+    return ORIGINAL_DO_POST(self)
+
+
+app.Handler.do_GET = patched_do_get
+app.Handler.do_POST = patched_do_post
 
 
 if __name__ == "__main__":
