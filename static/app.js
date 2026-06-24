@@ -1257,10 +1257,11 @@ async function proposeDimensions() {
     json: { model: $("accurateModel").value.trim() || "deepseek-v4-pro", mock },
     headers: key ? { "X-DeepSeek-Key": key } : {},
   });
+  startJobPolling();
   await loadProject(state.currentProjectId);
-  state.activePage = "lock";
-  showPage("lock");
-  showLog("维度草案已生成。请在“锁定规则”页的可编辑表单中检查、修改，再保存为锁定规则。");
+  state.activePage = "draft";
+  showPage("draft");
+  showLog(data.job_status ? "维度草案已进入后台生成。完成后再进入“锁定规则”页检查和修改。" : data);
 }
 
 async function saveDimensions() {
