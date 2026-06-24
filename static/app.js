@@ -278,6 +278,65 @@ async function restoreProjectBackup(id) {
   });
 }
 
+function safeFilePart(value) {
+  return String(value || "VOC项目")
+    .replace(/[\\/:*?"<>|]+/g, "-")
+    .replace(/\s+/g, "-")
+    .slice(0, 80);
+}
+
+function downloadJsonFile(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadCurrentProjectBackup() {
+  if (!state.currentProjectId) throw new Error("请先选择一个项目");
+  await withBusy("正在生成项目备份文件...", async () => {
+    const snapshot = await request(`/api/projects/${state.currentProjectId}/snapshot`);
+    await saveProjectBackup(snapshot);
+    const project = snapshot.project || {};
+    const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+    downloadJsonFile(`VOC项目备份-${safeFilePart(project.name)}-${project.id}-${date}.json`, snapshot);
+    showLog("项目备份文件已下载。下次 Render 历史丢失时，点“上传备份恢复”选择这个 JSON 文件即可继续。");
+  });
+}
+
+async function restoreProjectSnapshotFile(file) {
+  if (!file) return;
+  const text = await file.text();
+  let snapshot;
+  try {
+    snapshot = JSON.parse(text);
+  } catch (err) {
+    throw new Error("这个文件不是有效的项目备份 JSON");
+  }
+  if (snapshot?.schema !== "voc-project-snapshot-v1") {
+    throw new Error("这个 JSON 不是 VOC 项目备份文件");
+  }
+  const ok = window.confirm(`确认恢复备份项目「${snapshot.project?.name || snapshot.project?.id || "未命名项目"}」吗？\n\n恢复后会出现在左侧项目列表，可以从已完成步骤继续。`);
+  if (!ok) return;
+  await withBusy("正在上传备份并恢复项目...", async () => {
+    const data = await request("/api/projects/import-snapshot", { method: "POST", json: { snapshot } });
+    state.currentProjectId = data.project.id;
+    state.activePage = "project";
+    await loadProjects();
+    showLog("备份项目已恢复。");
+  });
+}
+
+function updateBackupActionState() {
+  const btn = $("downloadBackupBtn");
+  if (btn) btn.disabled = !state.currentProjectId || state.busy;
+}
+
 function showLog(value) {
   if (value instanceof Error) {
     $("logText").textContent = value.message || "发生未知错误";
@@ -322,6 +381,8 @@ function setBusy(text = "", statusId = "") {
     "unlockDimensionsBtn",
     "runAllFinalBtn",
     "generateAnalysisBtn",
+    "downloadBackupBtn",
+    "restoreBackupFileBtn",
   ];
   ids.forEach((id) => {
     const node = $(id);
@@ -330,6 +391,7 @@ function setBusy(text = "", statusId = "") {
   document.querySelectorAll(".run-batch, .final-batch, .project-delete, .subtab").forEach((btn) => {
     btn.disabled = Boolean(text);
   });
+  updateBackupActionState();
 }
 
 async function withBusy(text, task, statusId = "") {
@@ -521,6 +583,7 @@ function renderEmpty() {
   $("dimensionJson").value = "";
   $("exportLink").classList.add("disabled");
   $("exportLinkBottom").classList.add("disabled");
+  updateBackupActionState();
   stopJobPolling();
   showPage(state.activePage || "project");
 }
@@ -546,6 +609,7 @@ function renderProject(data) {
   renderAnalysisPreview(data.analysis_summary || {});
   renderJobStatus(data.job_status || {});
   bindSubTabs();
+  updateBackupActionState();
   showPage(state.activePage || "project");
   if (state.busy) setBusy(state.busyText, state.busyStatusId);
 }
@@ -710,6 +774,62 @@ function renderDimensionEditor(data) {
   renderRuleEditor(source);
 }
 
+function atomicRowsForEvidence() {
+  return state.fullAtomic || state.currentProject?.atomic_results || [];
+}
+
+function normalizeSourceTags(value) {
+  if (Array.isArray(value)) return value.map((x) => String(x || "").trim()).filter(Boolean);
+  if (typeof value === "string") return lines(value);
+  return [];
+}
+
+function sourceEvidenceItems(sourceTags = [], limit = 6) {
+  const wanted = new Set(normalizeSourceTags(sourceTags));
+  if (!wanted.size) return [];
+  const rows = atomicRowsForEvidence();
+  const items = [];
+  for (const row of rows || []) {
+    for (const tag of row.atomic_tags || []) {
+      if (!wanted.has(tag.atomic_tag_zh)) continue;
+      items.push({ row, tag });
+      if (items.length >= limit) return items;
+    }
+  }
+  return items;
+}
+
+function sourceEvidenceInner(sourceTags = [], limit = 6) {
+  const tags = normalizeSourceTags(sourceTags);
+  if (!tags.length) return `<div class="hint">暂无来源标签。可以先新增/修改“来源最小语义标签”，再保存。</div>`;
+  const items = sourceEvidenceItems(tags, limit);
+  if (!items.length) {
+    return `
+      <div class="source-tags">${tags.slice(0, 12).map((x) => `<span>${escapeHtml(x)}</span>`).join("")}</div>
+      <div class="hint">当前只加载了部分结果，可能看不到完整来源证据。点击“加载完整来源证据”后再判断。</div>
+    `;
+  }
+  return `
+    <div class="source-tags">${tags.slice(0, 12).map((x) => `<span>${escapeHtml(x)}</span>`).join("")}</div>
+    ${items.map(({ row, tag }) => `
+      <div class="source-evidence-row">
+        <strong>${escapeHtml(row.review_id || "")}</strong>
+        <span>${escapeHtml(usageLabel(tag.usage_marks || []))} · ${escapeHtml(tag.sentiment || "")}</span>
+        <div>${escapeHtml(tag.evidence_zh || tag.atomic_tag_zh || "")}</div>
+        <small>${escapeHtml(tag.evidence_original || "")}</small>
+      </div>
+    `).join("")}
+  `;
+}
+
+function refreshSourceEvidenceBlocks() {
+  document.querySelectorAll(".rule-card").forEach((card) => {
+    const target = card.querySelector(".source-evidence");
+    if (!target) return;
+    target.innerHTML = sourceEvidenceInner(lines(fieldValue(card, "source_atomic_tags")));
+  });
+}
+
 function renderRuleEditor(source) {
   const decision = source.decision_dimensions || [];
   const context = source.context_fields || [];
@@ -717,7 +837,8 @@ function renderRuleEditor(source) {
     <div class="rule-toolbar">
       <button id="addDecisionRule" class="ghost">新增购买决策维度</button>
       <button id="addContextRule" class="ghost">新增 Context 字段</button>
-      <span class="hint">改完后点“确认无误，保存为锁定规则”。保存前不会进入最终打标。</span>
+      <button id="loadSourceEvidenceBtn" class="ghost">加载完整来源证据</button>
+      <span class="hint">先看来源证据再改规则；改完后点“确认无误，保存为锁定规则”。</span>
     </div>
     <div class="dimension-section-title">可编辑：购买决策维度</div>
     <div id="decisionRuleList" class="rule-list">
@@ -730,12 +851,13 @@ function renderRuleEditor(source) {
   `;
   $("addDecisionRule").addEventListener("click", () => appendRuleCard("decision"));
   $("addContextRule").addEventListener("click", () => appendRuleCard("context"));
+  $("loadSourceEvidenceBtn").addEventListener("click", () => withBusy("正在加载完整来源证据...", loadFullAtomicRows, "lockStatus").catch(showLog));
   bindRuleDeleteButtons();
 }
 
 function ruleEditCard(item, type) {
   const isDecision = type === "decision";
-  const sourceTags = (item.source_atomic_tags || []).join("\n");
+  const sourceTags = normalizeSourceTags(item.source_atomic_tags || []).join("\n");
   return `
     <article class="rule-card" data-rule-type="${type}">
       <div class="rule-card-head">
@@ -770,6 +892,7 @@ function ruleEditCard(item, type) {
       `}
       <label>边界：什么该进，什么不该进<textarea data-field="boundary_zh" rows="2">${escapeHtml(item.boundary_zh || "")}</textarea></label>
       <label>来源最小语义标签（每行一个，用于追溯；可不改）<textarea data-field="source_atomic_tags" rows="3">${escapeHtml(sourceTags)}</textarea></label>
+      <div class="source-evidence">${sourceEvidenceInner(item.source_atomic_tags || [])}</div>
     </article>
   `;
 }
@@ -800,6 +923,9 @@ function bindRuleDeleteButtons() {
       card.querySelector('[data-field="boundary_zh"]').value = preset.boundary_zh;
       card.querySelector('[data-field="analysis_use_zh"]').value = preset.analysis_use_zh;
     };
+  });
+  document.querySelectorAll('[data-field="source_atomic_tags"]').forEach((textarea) => {
+    textarea.onchange = refreshSourceEvidenceBlocks;
   });
 }
 
@@ -925,6 +1051,10 @@ function dimensionCard(item, type, stat = {}) {
         <dt>运营用途</dt>
         <dd>${escapeHtml(listingUse || "未填写")}</dd>
       </dl>
+      <div class="source-evidence mini">
+        <strong>来源证据样例</strong>
+        ${sourceEvidenceInner(item.source_atomic_tags || [], 4)}
+      </div>
     </article>
   `;
 }
@@ -972,36 +1102,69 @@ function renderReviewRows(rows, partial = false) {
   `;
 }
 
+function usageLabel(marks = []) {
+  const set = new Set(marks || []);
+  const hasProduct = set.has("产品表现");
+  const hasContext = ["用户/关系", "场景/目的", "使用工具/搭配对象", "购买行为/态度"].some((x) => set.has(x));
+  if (hasProduct && hasContext) return "产品表现 + 用户背景/Context";
+  if (hasProduct) return "产品表现";
+  if (hasContext) return "用户背景/Context";
+  return (marks || []).join("、") || "未归属";
+}
+
 function renderAtomicRows(rows) {
   const box = $("atomicRowsTable");
   if (!box) return;
-  const flat = [];
-  for (const row of rows || []) {
-    for (const tag of row.atomic_tags || []) {
-      flat.push({ row, tag });
-    }
-  }
-  if (!flat.length) {
+  if (!(rows || []).length) {
     box.innerHTML = `<div class="hint" style="padding:12px">暂无最小语义标签行数据。</div>`;
     return;
   }
+  const body = [];
+  for (const row of rows || []) {
+    const tags = row.atomic_tags || [];
+    body.push(`
+      <tr class="review-group-row">
+        <td colspan="10">
+          <strong>${escapeHtml(row.review_id || "")}</strong>
+          <span>标签数：${formatNum(tags.length)}</span>
+          <span>批次：${escapeHtml(row.batch_id || "")}</span>
+          ${row.need_review ? `<span class="status done_with_warnings">NeedReview</span>` : ""}
+          <div class="review-translation">${escapeHtml(row.review_translation_zh || "暂无全文中文翻译")}</div>
+        </td>
+      </tr>
+    `);
+    if (!tags.length) {
+      body.push(`
+        <tr>
+          <td>${escapeHtml(row.review_id || "")}</td>
+          <td>${formatNum(tags.length)}</td>
+          <td>${escapeHtml(row.batch_id || "")}</td>
+          <td colspan="7" class="hint">这条 Review 未拆出可用最小语义标签。${escapeHtml((row.review_flags || []).join("；"))}</td>
+        </tr>
+      `);
+      continue;
+    }
+    tags.forEach((tag, index) => {
+      body.push(`
+        <tr>
+          <td>${escapeHtml(row.review_id || "")}</td>
+          <td>${formatNum(tags.length)}</td>
+          <td>${escapeHtml(row.batch_id || "")}</td>
+          <td>${index + 1}</td>
+          <td>${escapeHtml(tag.atomic_tag_zh || "")}</td>
+          <td class="long-cell">${escapeHtml(tag.evidence_zh || "")}</td>
+          <td class="long-cell">${escapeHtml(tag.evidence_original || "")}</td>
+          <td>${escapeHtml(usageLabel(tag.usage_marks || []))}</td>
+          <td>${escapeHtml(tag.sentiment || "")}</td>
+          <td>${row.need_review ? "是" : "否"}</td>
+        </tr>
+      `);
+    });
+  }
   box.innerHTML = `
     <table>
-      <thead><tr><th>ReviewID</th><th>批次</th><th>最小语义标签</th><th>倾向</th><th>归属</th><th>原文证据</th><th>中文翻译</th><th>NeedReview</th></tr></thead>
-      <tbody>
-        ${flat.map(({ row, tag }) => `
-          <tr>
-            <td>${escapeHtml(row.review_id || "")}</td>
-            <td>${escapeHtml(row.batch_id || "")}</td>
-            <td>${escapeHtml(tag.atomic_tag_zh || "")}</td>
-            <td>${escapeHtml(tag.sentiment || "")}</td>
-            <td>${(tag.usage_marks || []).map(escapeHtml).join("、")}</td>
-            <td class="long-cell">${escapeHtml(tag.evidence_original || "")}</td>
-            <td class="long-cell">${escapeHtml(row.review_translation_zh || "")}</td>
-            <td>${row.need_review ? "是" : "否"}</td>
-          </tr>
-        `).join("")}
-      </tbody>
+      <thead><tr><th>ReviewID</th><th>标签数</th><th>批次</th><th>标签序号</th><th>最小语义标签</th><th>证据中文翻译</th><th>原文证据</th><th>归属</th><th>倾向</th><th>NeedReview</th></tr></thead>
+      <tbody>${body.join("")}</tbody>
     </table>
   `;
 }
@@ -1013,12 +1176,14 @@ function renderAtomicPreview(rows) {
   }
   const html = [`<div class="hint">这里只预览最近结果，不展示 1000 条全量明细；全量会参与后续维度草案和导出。</div>`];
   for (const row of rows.slice(0, 30)) {
+    html.push(`<div class="tag-review-head"><strong>${escapeHtml(row.review_id || "")}</strong><span>标签数：${formatNum((row.atomic_tags || []).length)}</span></div>`);
     for (const tag of row.atomic_tags || []) {
       html.push(`
         <div class="tag-row">
           <strong>${escapeHtml(tag.atomic_tag_zh || "")}</strong>
-          <small>${escapeHtml(row.review_id || "")} · ${escapeHtml(tag.sentiment || "")} · ${(tag.usage_marks || []).map(escapeHtml).join("、")}</small>
-          <div class="hint">${escapeHtml(tag.evidence_original || "")}</div>
+          <small>${escapeHtml(tag.sentiment || "")} · ${escapeHtml(usageLabel(tag.usage_marks || []))}</small>
+          <div class="hint">证据译文：${escapeHtml(tag.evidence_zh || "")}</div>
+          <div class="hint">原文证据：${escapeHtml(tag.evidence_original || "")}</div>
         </div>
       `);
     }
@@ -1197,6 +1362,8 @@ async function loadFullAtomicRows() {
   const data = await request(`/api/projects/${state.currentProjectId}/atomic-results`);
   state.fullAtomic = data.atomic_results || [];
   renderAtomicRows(state.fullAtomic);
+  if (state.currentProject) renderDimensionCards(state.currentProject);
+  refreshSourceEvidenceBlocks();
 }
 
 async function runBatch(batchId, options = {}) {
@@ -1356,6 +1523,13 @@ function bindEvents() {
     $("projectName").focus();
   });
   $("refreshBtn").addEventListener("click", () => loadProjects().catch(showLog));
+  $("downloadBackupBtn").addEventListener("click", () => downloadCurrentProjectBackup().catch(showLog));
+  $("restoreBackupFileBtn").addEventListener("click", () => $("restoreBackupInput").click());
+  $("restoreBackupInput").addEventListener("change", (event) => {
+    restoreProjectSnapshotFile(event.target.files?.[0]).catch(showLog).finally(() => {
+      event.target.value = "";
+    });
+  });
   $("createProjectBtn").addEventListener("click", () => withBusy("正在创建项目...", createProject, "projectStatus").catch(showLog));
   $("uploadBtn").addEventListener("click", () => withBusy("正在上传并识别 Review...", uploadReviews, "uploadStatus").catch(showLog));
   $("loadReviewRowsBtn").addEventListener("click", () => withBusy("正在加载全量 Review 表...", loadFullReviews, "uploadStatus").catch(showLog));
