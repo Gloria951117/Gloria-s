@@ -10,4 +10,4 @@ ENV VOC_DATA_DIR=/var/data/data
 ENV VOC_EXPORT_DIR=/var/data/exports
 EXPOSE 8787
 
-CMD ["python", "app.py"]
+CMD ["python", "server.py"]
