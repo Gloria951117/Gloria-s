@@ -335,6 +335,45 @@ button:disabled,
   font-size: 12px;
 }
 
+.backup-list {
+  max-height: 260px;
+}
+
+.backup-item {
+  grid-template-columns: 1fr;
+}
+
+.backup-info small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.backup-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.backup-restore,
+.backup-delete {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.backup-restore {
+  background: var(--blue-2);
+  color: var(--blue);
+  border-color: #bcd7ea;
+}
+
+.backup-delete {
+  color: var(--red);
+  border-color: #f3c0bd;
+  background: #fff7f6;
+}
+
 .run-status {
   margin-top: 6px;
   border-radius: 999px;
