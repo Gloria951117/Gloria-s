@@ -1789,15 +1789,20 @@ def selectable_batches(project_id: str, kind: str, scope: str) -> list[dict]:
 
 
 def start_background_job(project_id: str, kind: str, scope: str, api_key: str, model: str, mock: bool) -> dict:
-    if kind not in {"atomic", "final"}:
+    if kind not in {"atomic", "dimension", "final"}:
         raise ValueError("invalid_job_kind")
     if not get_project(project_id):
         raise ValueError("project_not_found")
     if not mock and not api_key:
         raise ValueError("missing_deepseek_key")
-    batches = selectable_batches(project_id, kind, scope)
-    if not batches:
-        raise ValueError("no_pending_batches")
+    if kind == "dimension":
+        if not read_json(project_dir(project_id) / "atomic_results.json", []):
+            raise ValueError("missing_atomic_results")
+        batches = [{"id": "DIM001", "start_seq": 0, "end_seq": 0, "review_count": 0}]
+    else:
+        batches = selectable_batches(project_id, kind, scope)
+        if not batches:
+            raise ValueError("no_pending_batches")
 
     with JOBS_LOCK:
         active = ACTIVE_JOBS.get(project_id)
@@ -1849,6 +1854,8 @@ def run_background_job(project_id: str, job_id: str, kind: str, batches: list[di
             try:
                 if kind == "atomic":
                     process_atomic_batch(project_id, batch_id, api_key, model, mock)
+                elif kind == "dimension":
+                    generate_dimension_model(project_id, api_key, model, mock)
                 else:
                     process_final_batch(project_id, batch_id, api_key, model, mock)
                 completed += 1
@@ -2311,8 +2318,8 @@ class Handler(SimpleHTTPRequestHandler):
                 send_json(self, {"error": "missing_deepseek_key"}, 400)
                 return
             try:
-                draft = generate_dimension_model(project_id, api_key, model, mock)
-                send_json(self, {"status": "ok", "dimension_model": draft, "stats": project_stats(project_id)})
+                job = start_background_job(project_id, "dimension", "all", api_key, model, mock)
+                send_json(self, {"status": "started", "job_status": job, "stats": project_stats(project_id)})
             except Exception as e:
                 send_json(self, {"error": "dimension_model_failed", "detail": str(e)}, 500)
             return
