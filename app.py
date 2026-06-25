@@ -1760,13 +1760,39 @@ def process_atomic_batch(project_id: str, batch_id: str, api_key: str, model: st
     set_batch_status(project_id, batch_id, status="running", model=model, started_at=now_iso(), error="")
     started = time.time()
     try:
+        all_usages = []
+        all_errors = []
+        review_chunks = list(chunks(pending_reviews, ATOMIC_MODEL_CHUNK_SIZE))
         if mock:
             result, usage = mock_atomic_extract(pending_reviews)
+            errors = validate_atomic_result(result, {r["review_id"] for r in pending_reviews})
+            merge_atomic_results(project_id, batch_id, result, usage)
         else:
-            result, usages = atomic_model_call(project, pending_reviews, api_key, model)
-            usage = compact_usage(usages) if len(usages) > 1 else usages[0]
-        errors = validate_atomic_result(result, {r["review_id"] for r in pending_reviews})
-        merge_atomic_results(project_id, batch_id, result, usage)
+            for idx, review_chunk in enumerate(review_chunks, start=1):
+                progress_label = f"{batch_id} {idx}/{len(review_chunks)}"
+                set_batch_status(project_id, batch_id, status="running", model=model, current_chunk=progress_label, error="")
+                current_job = read_job_status(project_id)
+                if current_job.get("kind") == "atomic" and current_job.get("status") == "running":
+                    write_job_status(
+                        project_id,
+                        {
+                            "current_batch": progress_label,
+                            "updated_at": now_iso(),
+                        },
+                    )
+                try:
+                    chunk_result, chunk_usages = atomic_model_call(project, review_chunk, api_key, model)
+                    validation_errors = validate_atomic_result(chunk_result, {r["review_id"] for r in review_chunk})
+                    chunk_usage = compact_usage(chunk_usages) if len(chunk_usages) > 1 else chunk_usages[0]
+                    merge_atomic_results(project_id, batch_id, chunk_result, chunk_usage)
+                    all_usages.extend(chunk_usages)
+                    if validation_errors:
+                        chunk_errors_text = "；".join(validation_errors[:3])
+                        all_errors.append(f"{progress_label}: {chunk_errors_text}")
+                except Exception as chunk_error:
+                    all_errors.append(f"{progress_label}: {chunk_error}")
+            errors = all_errors
+            usage = compact_usage(all_usages)
         propose_dimensions(project_id)
         latest_rows = read_json(project_dir(project_id) / "atomic_results.json", [])
         completed_ids = {
@@ -1783,7 +1809,10 @@ def process_atomic_batch(project_id: str, batch_id: str, api_key: str, model: st
             status="done" if not missing_after and not errors else "partial",
             finished_at=now_iso(),
             error="；".join(errors[:5]),
+            current_chunk="",
         )
+        if errors:
+            raise RuntimeError("；".join(errors[:5]))
         return {
             "status": "ok",
             "validation_errors": errors,
