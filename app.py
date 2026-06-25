@@ -805,6 +805,8 @@ def merge_atomic_model_results(parts: list[dict]) -> dict:
 
 
 def atomic_max_tokens(review_count: int) -> int:
+    if review_count <= 1:
+        return 8000
     return min(6000, max(3500, review_count * 3000))
 
 
@@ -818,22 +820,32 @@ def atomic_model_call(project: dict, reviews: list[dict], api_key: str, model: s
             usages.extend(chunk_usages)
         return merge_atomic_model_results(results), usages
 
-    try:
-        result, usage = deepseek_chat(
-            api_key,
-            model,
-            atomic_prompt(project, reviews),
-            max_tokens=atomic_max_tokens(len(reviews)),
-            timeout=45,
-        )
-    except ModelJsonError as e:
-        if len(reviews) <= 1:
-            raise RuntimeError(f"model_json_invalid_single_review: {e}") from e
-        mid = max(1, len(reviews) // 2)
-        left_result, left_usage = atomic_model_call(project, reviews[:mid], api_key, model)
-        right_result, right_usage = atomic_model_call(project, reviews[mid:], api_key, model)
-        failed_usage = [e.usage] if isinstance(e.usage, dict) and e.usage else []
-        return merge_atomic_model_results([left_result, right_result]), failed_usage + left_usage + right_usage
+    attempts = 2 if len(reviews) <= 1 else 1
+    last_json_error = None
+    for attempt in range(attempts):
+        try:
+            result, usage = deepseek_chat(
+                api_key,
+                model,
+                atomic_prompt(project, reviews),
+                max_tokens=atomic_max_tokens(len(reviews)),
+                timeout=45,
+            )
+            break
+        except ModelJsonError as e:
+            last_json_error = e
+            if attempt < attempts - 1:
+                time.sleep(0.5)
+                continue
+            if len(reviews) <= 1:
+                raise RuntimeError(f"model_json_invalid_single_review: {e}") from e
+            mid = max(1, len(reviews) // 2)
+            left_result, left_usage = atomic_model_call(project, reviews[:mid], api_key, model)
+            right_result, right_usage = atomic_model_call(project, reviews[mid:], api_key, model)
+            failed_usage = [e.usage] if isinstance(e.usage, dict) and e.usage else []
+            return merge_atomic_model_results([left_result, right_result]), failed_usage + left_usage + right_usage
+    else:
+        raise RuntimeError(f"model_json_invalid: {last_json_error}")
 
     expected_ids = {r["review_id"] for r in reviews}
     errors = validate_atomic_result(result, expected_ids)
