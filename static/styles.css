@@ -1082,6 +1082,15 @@ th {
   color: var(--muted);
 }
 
+.job-error-details {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #f1c5c5;
+  color: #9f1d1d;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 dialog {
   width: min(900px, 90vw);
   border: 1px solid var(--line);

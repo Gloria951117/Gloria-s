@@ -422,12 +422,24 @@ function backendStatusText(job) {
   return `后台状态：${job.status}`;
 }
 
+function backendErrorDetails(job) {
+  const errors = Array.isArray(job?.batch_errors) ? job.batch_errors.filter((x) => x?.error) : [];
+  if (!errors.length) return "";
+  return `
+    <div class="job-error-details">
+      ${errors.map((item) => `
+        <div><strong>${escapeHtml(item.batch_id || "批次")}</strong>：${escapeHtml(item.error || "")}</div>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderJobStatus(job) {
   const isRunning = isBackgroundJobRunning(job);
   const targetId = job?.kind === "final" ? "finalStatus" : "atomicStatus";
   const target = $(targetId);
   if (target && job?.kind) {
-    target.textContent = backendStatusText(job);
+    target.innerHTML = `${escapeHtml(backendStatusText(job))}${backendErrorDetails(job)}`;
     target.className = `local-run-status ${isRunning ? "running" : "idle"}`;
   }
   ["runCalibrationAtomicBtn", "runAllAtomicBtn", "runAllFinalBtn"].forEach((id) => {
