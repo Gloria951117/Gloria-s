@@ -45,7 +45,7 @@ SNAPSHOT_FILES = [
     "job_status.json",
 ]
 FINAL_LABEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_FINAL_LABEL_CHUNK_SIZE", "8")))
-ATOMIC_MODEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_ATOMIC_MODEL_CHUNK_SIZE", "2")))
+ATOMIC_MODEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_ATOMIC_MODEL_CHUNK_SIZE", "1")))
 DIMENSION_PRODUCT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_PRODUCT_TAG_LIMIT", "60")))
 DIMENSION_CONTEXT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_CONTEXT_TAG_LIMIT", "60")))
 DIMENSION_EVIDENCE_LIMIT = max(40, int(os.environ.get("VOC_DIMENSION_EVIDENCE_LIMIT", "120")))
@@ -805,7 +805,7 @@ def merge_atomic_model_results(parts: list[dict]) -> dict:
 
 
 def atomic_max_tokens(review_count: int) -> int:
-    return min(12000, max(5000, review_count * 3500))
+    return min(6000, max(3500, review_count * 3000))
 
 
 def atomic_model_call(project: dict, reviews: list[dict], api_key: str, model: str):
@@ -824,7 +824,7 @@ def atomic_model_call(project: dict, reviews: list[dict], api_key: str, model: s
             model,
             atomic_prompt(project, reviews),
             max_tokens=atomic_max_tokens(len(reviews)),
-            timeout=90,
+            timeout=45,
         )
     except ModelJsonError as e:
         if len(reviews) <= 1:
