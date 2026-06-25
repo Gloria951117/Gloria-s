@@ -45,6 +45,7 @@ SNAPSHOT_FILES = [
     "job_status.json",
 ]
 FINAL_LABEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_FINAL_LABEL_CHUNK_SIZE", "8")))
+ATOMIC_MODEL_CHUNK_SIZE = max(1, int(os.environ.get("VOC_ATOMIC_MODEL_CHUNK_SIZE", "4")))
 DIMENSION_PRODUCT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_PRODUCT_TAG_LIMIT", "60")))
 DIMENSION_CONTEXT_TAG_LIMIT = max(20, int(os.environ.get("VOC_DIMENSION_CONTEXT_TAG_LIMIT", "60")))
 DIMENSION_EVIDENCE_LIMIT = max(40, int(os.environ.get("VOC_DIMENSION_EVIDENCE_LIMIT", "120")))
@@ -803,8 +804,36 @@ def merge_atomic_model_results(parts: list[dict]) -> dict:
     return {"reviews": list(merged.values())}
 
 
+def atomic_max_tokens(review_count: int) -> int:
+    return min(30000, max(12000, review_count * 3000))
+
+
 def atomic_model_call(project: dict, reviews: list[dict], api_key: str, model: str):
-    result, usage = deepseek_chat(api_key, model, atomic_prompt(project, reviews))
+    if len(reviews) > ATOMIC_MODEL_CHUNK_SIZE:
+        results = []
+        usages = []
+        for review_chunk in chunks(reviews, ATOMIC_MODEL_CHUNK_SIZE):
+            chunk_result, chunk_usages = atomic_model_call(project, review_chunk, api_key, model)
+            results.append(chunk_result)
+            usages.extend(chunk_usages)
+        return merge_atomic_model_results(results), usages
+
+    try:
+        result, usage = deepseek_chat(
+            api_key,
+            model,
+            atomic_prompt(project, reviews),
+            max_tokens=atomic_max_tokens(len(reviews)),
+        )
+    except ModelJsonError as e:
+        if len(reviews) <= 1:
+            raise RuntimeError(f"model_json_invalid_single_review: {e}") from e
+        mid = max(1, len(reviews) // 2)
+        left_result, left_usage = atomic_model_call(project, reviews[:mid], api_key, model)
+        right_result, right_usage = atomic_model_call(project, reviews[mid:], api_key, model)
+        failed_usage = [e.usage] if isinstance(e.usage, dict) and e.usage else []
+        return merge_atomic_model_results([left_result, right_result]), failed_usage + left_usage + right_usage
+
     expected_ids = {r["review_id"] for r in reviews}
     errors = validate_atomic_result(result, expected_ids)
     missing_ids = expected_ids - result_review_ids(result)
